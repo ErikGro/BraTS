@@ -20,6 +20,8 @@ from spython.main import Client
 import docker
 import tempfile
 import os
+import urllib.request
+import json
 
 try:
     docker_client = docker.from_env()
@@ -112,35 +114,66 @@ def _convert_volume_mappings_to_singularity_format(
         singularity_bindings.append(f"{str(host_path)}:{container_path}")
     return singularity_bindings
 
-
 def _get_docker_working_dir(image: str) -> Optional[Path]:
     """
-    Retrieve the working directory configured in the Docker image.
-
-    This is required to properly initialize the working directory for the Singularity container,
-    ensuring that the container starts in the correct location as defined by the Docker image.
-
-    Args:
-        image (str): The Docker image name or ID.
-
-    Returns:
-        Path | None: The working directory specified in the Docker image configuration. None if docker client is not available.
+    Fetch the WorkingDir directly from the Docker Hub API.
+    This bypasses the need for a local Docker Daemon, making it HPC-friendly.
     """
-    if docker_client is None:
-        return None
+    logger.debug(f"Fetching OCI config for {image} from Docker Hub API...")
     try:
-        logger.debug(f"Inspecting image {image}")
-        image_obj = docker_client.images.get(image)
-    except docker.errors.ImageNotFound:
-        logger.debug(f"Image {image} not found locally.")
-        _ensure_docker_image(image)
-        image_obj = docker_client.images.get(image)
-    workdir = image_obj.attrs["Config"].get("WorkingDir", None)
-    logger.debug(f"Working directory: {workdir}")
-    if workdir is None:
+        # Parse image string (e.g., "brainles/brats25_inpainting_ying_weng:latest")
+        if ":" in image:
+            repo, tag = image.split(":")
+        else:
+            repo, tag = image, "latest"
+            
+        # Add implicit 'library/' for official images if missing
+        if "/" not in repo:
+            repo = f"library/{repo}"
+
+        # 1. Get anonymous bearer token
+        token_url = f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repo}:pull"
+        req = urllib.request.Request(token_url)
+        with urllib.request.urlopen(req) as resp:
+            token = json.loads(resp.read().decode())["token"]
+
+        # 2. Setup headers to accept both single and multi-arch manifests
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json"
+        }
+        
+        # 3. Fetch manifest
+        manifest_url = f"https://registry-1.docker.io/v2/{repo}/manifests/{tag}"
+        req = urllib.request.Request(manifest_url, headers=headers)
+        with urllib.request.urlopen(req) as resp:
+            manifest = json.loads(resp.read().decode())
+
+        # If it's a multi-arch index, grab the first manifest's digest
+        if "manifests" in manifest:
+            digest = manifest["manifests"][0]["digest"]
+            req = urllib.request.Request(f"https://registry-1.docker.io/v2/{repo}/manifests/{digest}", headers=headers)
+            with urllib.request.urlopen(req) as resp:
+                manifest = json.loads(resp.read().decode())
+
+        # 4. Fetch the actual config blob
+        config_digest = manifest["config"]["digest"]
+        req = urllib.request.Request(f"https://registry-1.docker.io/v2/{repo}/blobs/{config_digest}", headers=headers)
+        with urllib.request.urlopen(req) as resp:
+            config_blob = json.loads(resp.read().decode())
+            
+        # Extract WorkingDir
+        workdir = config_blob.get("config", {}).get("WorkingDir")
+        
+        if workdir:
+            logger.debug(f"Found WorkingDir via API: {workdir}")
+            return Path(workdir)
+        else:
+            return None
+
+    except Exception as e:
+        logger.warning(f"Failed to fetch WORKDIR from registry: {e}. Falling back to default.")
         return None
-    else:
-        return Path(workdir)
 
 
 def run_container(
@@ -208,8 +241,8 @@ def run_container(
         volume_mappings
     )
 
-    options = []
-
+    #options = []
+    options = ["--no-home"]
     if len(device_requests) > 0 and not force_cpu:
         logger.info(f"Using CUDA devices: {cuda_devices}")
         options.append("--nv")  # Singularity uses --nv to enable GPU support
@@ -217,7 +250,7 @@ def run_container(
     # TODO: The --fakeroot option may be required for certain algorithms that need root privileges inside the Singularity container.
     docker_working_dir = _get_docker_working_dir(algorithm.run_args.docker_image)
     if docker_working_dir is not None:
-        options.append("--cwd")
+        options.append("--pwd")
         options.append(str(docker_working_dir))
     else:
         logger.warning(
@@ -241,18 +274,41 @@ def run_container(
             check=True,
         )
         overlay_created = True
-    try:
-        executor = Client.run(
-            image,
-            options=options,
-            args=args,
-            stream=True,
-            bind=singularity_bindings,
-        )
-        container_output = []
-        for line in executor:
-            container_output.append(line)
 
+
+    # 1. Manually construct the singularity command
+    cmd = ["singularity", "run"]
+    cmd.extend(options)
+    
+    for bind in singularity_bindings:
+        cmd.extend(["--bind", bind])
+        
+    cmd.append(image)
+    if args:
+        cmd.extend(args)
+        
+    logger.debug(f"Executing Singularity command: {' '.join(cmd)}")
+    
+    container_output = []
+
+    try:
+        # 2. Use Popen, redirecting stderr to stdout (STDOUT) so we catch everything
+        with subprocess.Popen(
+            cmd, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.STDOUT, 
+            text=True, 
+            bufsize=1 # Line-buffered
+        ) as proc:
+            for line in proc.stdout:
+                # 3. Use logger or a flushed print. 
+                # (Ideally, pass a tqdm.write callback here, but for now, we force a flush)
+                print(line, end="", flush=True) 
+                container_output.append(line)
+        
+        if proc.returncode != 0:
+            logger.error(f"Container exited with return code {proc.returncode}")
+            r
         _sanity_check_output(
             data_path=data_path,
             output_path=output_path,
